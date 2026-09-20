@@ -2,7 +2,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, statSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { join } from "node:path";
 import { homedir } from "node:os";
 import { VERSION } from "./version.js";
@@ -22,6 +23,61 @@ function today(): string {
 
 function text(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
+}
+
+// Files that exist in the export directory but have not been downloaded from iCloud
+// yet. Reading one of these with readFileSync blocks the whole process until iCloud
+// materializes it, which can be forever if sync is stalled. We record them here per
+// tool call and surface them in the response instead.
+let notDownloaded: string[] = [];
+
+function isPlaceholder(path: string): boolean {
+  try {
+    const st = statSync(path);
+    // An iCloud "dataless" file reports its real size but occupies zero blocks on disk.
+    return st.size > 0 && st.blocks === 0;
+  } catch {
+    return false;
+  }
+}
+
+function nudgeDownload(path: string): void {
+  // Ask iCloud Drive to fetch the file. Fire-and-forget; never wait on it.
+  if (process.platform !== "darwin") return;
+  try {
+    spawn("brctl", ["download", path], { detached: true, stdio: "ignore" }).unref();
+  } catch {
+    // brctl missing or not permitted: nothing else to do.
+  }
+}
+
+// Read an export file, or return null if it is absent or not yet downloaded.
+function readExportFile(path: string): string | null {
+  if (!existsSync(path)) return null;
+  if (isPlaceholder(path)) {
+    notDownloaded.push(path);
+    nudgeDownload(path);
+    return null;
+  }
+  return readFileSync(path, "utf-8");
+}
+
+function beginCall(): void {
+  notDownloaded = [];
+}
+
+// Attach a warning to a tool result when files were skipped, so a "no data" answer
+// can never be mistaken for "no data exists".
+function withWarnings<T extends Record<string, unknown>>(data: T): T & { warnings?: string[] } {
+  if (notDownloaded.length === 0) return data;
+  const files = [...new Set(notDownloaded)];
+  return {
+    ...data,
+    warnings: [
+      `${files.length} export file(s) exist but are not downloaded from iCloud yet, so they were skipped. ` +
+      `iCloud Drive may be stalled; a download was requested for each. Skipped: ${files.join(", ")}`,
+    ],
+  };
 }
 
 function avg(arr: number[]): number | null {
@@ -136,9 +192,10 @@ const SLEEP_JSON_FIELDS: Array<[string, keyof DailyMetrics]> = [
 
 function parseMetricsJson(date: string): DailyMetrics | null {
   const path = join(METRICS_DIR_JSON, `HealthAutoExport-${date}.json`);
-  if (!existsSync(path)) return null;
+  const content = readExportFile(path);
+  if (content === null) return null;
 
-  const raw = JSON.parse(readFileSync(path, "utf-8"));
+  const raw = JSON.parse(content);
   const metrics: Array<{ name: string; data?: Array<Record<string, unknown>> }> = raw?.data?.metrics ?? [];
   const totals = emptyTotals();
 
@@ -183,10 +240,11 @@ function parseMetricsJson(date: string): DailyMetrics | null {
 }
 
 function parseMetricsCsvFile(path: string): DailyMetrics | null {
-  if (!existsSync(path)) return null;
+  const content = readExportFile(path);
+  if (content === null) return null;
 
   const totals = emptyTotals();
-  const rows = parseCSV(readFileSync(path, "utf-8"));
+  const rows = parseCSV(content);
 
   for (const row of rows) {
     const val = (...keys: string[]): number | null => {
@@ -270,9 +328,10 @@ function trimDate(s: unknown): string {
 
 function parseWorkoutsJson(date: string): Workout[] | null {
   const path = join(WORKOUTS_DIR_JSON, `HealthAutoExport-${date}.json`);
-  if (!existsSync(path)) return null;
+  const content = readExportFile(path);
+  if (content === null) return null;
 
-  const raw = JSON.parse(readFileSync(path, "utf-8"));
+  const raw = JSON.parse(content);
   const workouts: Array<Record<string, unknown>> = raw?.data?.workouts ?? [];
   const qty = (v: unknown): string | null => {
     if (typeof v === "object" && v !== null && "qty" in v) {
@@ -308,11 +367,12 @@ function parseWorkouts(date: string): Workout[] {
   if (fromJson !== null) return fromJson;
 
   const path = join(WORKOUTS_DIR, `Workouts-${date}.csv`);
-  if (!existsSync(path)) return [];
+  const content = readExportFile(path);
+  if (content === null) return [];
 
   const optStr = (val: string | undefined): string | null => val && val !== "" ? val : null;
 
-  return parseCSV(readFileSync(path, "utf-8")).map(row => ({
+  return parseCSV(content).map(row => ({
     type: row["Type"] ?? "",
     start: row["Start"] ?? "",
     end: row["End"] ?? "",
@@ -386,11 +446,12 @@ server.registerTool("apple_health_daily", {
   description: "Get Apple Health daily summary: steps, energy, HR, HRV, sleep stages, body comp, workouts",
   inputSchema: z.object({ date: optDate }),
 }, async ({ date }) => {
+  beginCall();
   const d = date ?? today();
   const metrics = parseMetrics(d);
-  if (!metrics) return text({ error: `No health data found for ${d}`, paths: [METRICS_DIR_JSON, METRICS_DIR] });
+  if (!metrics) return text(withWarnings({ error: `No health data found for ${d}`, paths: [METRICS_DIR_JSON, METRICS_DIR] }));
   const workouts = parseWorkouts(d);
-  return text(formatDailySummary(d, metrics, workouts));
+  return text(withWarnings(formatDailySummary(d, metrics, workouts)));
 });
 
 server.registerTool("apple_health_workouts", {
@@ -398,9 +459,10 @@ server.registerTool("apple_health_workouts", {
   description: "Get workout sessions for a date",
   inputSchema: z.object({ date: optDate }),
 }, async ({ date }) => {
+  beginCall();
   const d = date ?? today();
   const workouts = parseWorkouts(d);
-  return text({ date: d, count: workouts.length, workouts });
+  return text(withWarnings({ date: d, count: workouts.length, workouts }));
 });
 
 server.registerTool("apple_health_trends", {
@@ -410,6 +472,7 @@ server.registerTool("apple_health_trends", {
     days: z.number().optional().describe("Number of days to look back (default 7)"),
   }),
 }, async ({ days }) => {
+  beginCall();
   const n = days ?? 7;
   const results: Array<Record<string, unknown>> = [];
 
@@ -440,7 +503,7 @@ server.registerTool("apple_health_trends", {
     }
   }
 
-  return text(results);
+  return text(withWarnings({ days: n, results }));
 });
 
 async function main() {
